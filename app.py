@@ -25,7 +25,7 @@ def add_timestamp():
         draw = ImageDraw.Draw(image)
 
         # choose font (try several common paths, fallback to default)
-        font_size = int(data.get("font_size", 34))
+        font_size = int(data.get("font_size", 25))
         font = None
         font_candidates = [
             "arial.ttf",
