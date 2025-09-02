@@ -1,123 +1,76 @@
+import os
 import base64
 import io
-import re
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from flask import Flask, request, jsonify
 from PIL import Image, ImageDraw, ImageFont
+from flask_cors import CORS
 
-app = FastAPI(title="Image Timestamp Service")
+app = Flask(__name__)
+CORS(app)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # tighten later for security
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- Models ----------
-class ImageStampRequest(BaseModel):
-    base64string: str          # base64 image string
-    timestamp: str             # "yyyy-MM-dd HH:mm:ss"
-    position: Optional[str] = "bottom-left"
-    padding: Optional[int] = 12
-    font_ratio: Optional[float] = 0.05
-    text_color: Optional[str] = "white"
-    outline_color: Optional[str] = "black"
-    draw_bg: Optional[bool] = True
-
-# ---------- Helpers ----------
-DATA_URL_RX = re.compile(r"^data:image/[^;]+;base64,", re.IGNORECASE)
-
-def _decode_base64_image(s: str) -> Image.Image:
+@app.route("/add_timestamp", methods=["POST"])
+def add_timestamp():
     try:
-        if DATA_URL_RX.match(s):
-            s = DATA_URL_RX.sub("", s)
-        raw = base64.b64decode(s)
-        img = Image.open(io.BytesIO(raw))
-        return img.convert("RGBA")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 image: {e}")
+        data = request.get_json(force=True)
+        if not data or "image" not in data:
+            return jsonify({"error": "Missing 'image' in request body"}), 400
+        if "timestamp" not in data:
+            return jsonify({"error": "Missing 'timestamp' in request body"}), 400
 
-def _load_font(px: int):
-    candidates = [
-        "fonts/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "arial.ttf",
-    ]
-    for path in candidates:
+        # decode base64 image
+        img_data = base64.b64decode(data["image"])
+        image = Image.open(io.BytesIO(img_data)).convert("RGB")
+        timestamp = str(data["timestamp"])
+
+        draw = ImageDraw.Draw(image)
+
+        # choose font (try several common paths, fallback to default)
+        font_size = int(data.get("font_size", 34))
+        font = None
+        font_candidates = [
+            "arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "DejaVuSans.ttf"
+        ]
+        for fpath in font_candidates:
+            try:
+                font = ImageFont.truetype(fpath, font_size)
+                break
+            except Exception:
+                font = None
+        if font is None:
+            font = ImageFont.load_default()
+
+        # measure text
         try:
-            return ImageFont.truetype(path, px)
-        except Exception:
-            pass
-    return ImageFont.load_default()
+            bbox = draw.textbbox((0, 0), timestamp, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+        except AttributeError:
+            text_w, text_h = draw.textsize(timestamp, font=font)
 
-def _draw_text_with_outline(draw: ImageDraw.ImageDraw, xy, text, font, fill, outline, stroke=1):
-    x, y = xy
-    for dx in (-stroke, 0, stroke):
-        for dy in (-stroke, 0, stroke):
-            if dx or dy:
-                draw.text((x + dx, y + dy), text, font=font, fill=outline)
-    draw.text((x, y), text, font=font, fill=fill)
+        left_padding = int(data.get("left_padding", 8))
+        bottom_padding = int(data.get("bottom_padding", 20))
+        x = left_padding
+        y = image.height - text_h - bottom_padding
 
-def _text_size(draw: ImageDraw.ImageDraw, text: str, font) -> tuple:
-    try:
-        l, t, r, b = draw.textbbox((0, 0), text, font=font)
-        return (r - l), (b - t)
-    except Exception:
-        return draw.textsize(text, font=font)
+        # draw thin border/shadow for visibility
+        border_color = (0, 0, 0)
+        for dx, dy in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,1),(1,-1),(-1,1)]:
+            draw.text((x+dx, y+dy), timestamp, font=font, fill=border_color)
 
-def _place(position: str, W: int, H: int, w: int, h: int, pad: int) -> tuple:
-    pos = position.lower()
-    if pos == "bottom-right":
-        return W - w - pad, H - h - pad
-    if pos == "top-left":
-        return pad, pad
-    if pos == "top-right":
-        return W - w - pad, pad
-    if pos == "center":
-        return (W - w) // 2, (H - h) // 2
-    return pad, H - h - pad
+        # main text (white)
+        draw.text((x, y), timestamp, font=font, fill=(255, 255, 255))
 
-# ---------- Endpoint ----------
-@app.post("/write_time")
-def write_time(req: ImageStampRequest):
-    img = _decode_base64_image(req.base64string)
-    W, H = img.size
+        # output back to base64 jpeg
+        buffered = io.BytesIO()
+        image.save(buffered, format="JPEG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return jsonify({"timestamped_image": img_base64})
 
-    font_px = max(12, int(min(W, H) * float(req.font_ratio or 0.05)))
-    font = _load_font(font_px)
-    draw = ImageDraw.Draw(img, "RGBA")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    text = req.timestamp
-    tw, th = _text_size(draw, text, font)
-    pad = int(req.padding or 0)
-    x, y = _place(req.position or "bottom-left", W, H, tw, th, pad)
-
-    if req.draw_bg:
-        rect = (x - 6, y - 4, x + tw + 6, y + th + 4)
-        draw.rectangle(rect, fill=(0, 0, 0, 120))
-
-    _draw_text_with_outline(
-        draw,
-        (x, y),
-        text,
-        font=font,
-        fill=req.text_color or "white",
-        outline=req.outline_color or "black",
-        stroke=max(1, font_px // 18),
-    )
-
-    out = io.BytesIO()
-    img.save(out, format="PNG")
-    b64 = base64.b64encode(out.getvalue()).decode("ascii")
-
-    return {
-        "image": f"data:image/png;base64,{b64}",
-        "width": W,
-        "height": H,
-        "format": "PNG"
-    }
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port, debug=True)
